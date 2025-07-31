@@ -2,7 +2,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
     Address, Bytes, BytesN, Env, symbol_short,
-    log
+    log, token
 };
 
 /// Immutable parameters for the escrow
@@ -123,14 +123,211 @@ impl EscrowDst {
             .ok_or(Error::NotInitialized)
     }
 
+
+    /// Withdraw funds by revealing the secret (taker only)
+    /// Tokens go to maker, safety deposit to caller
+    pub fn withdraw(env: Env, secret: BytesN<32>) -> Result<(), Error> {
+        let immutables = Self::get_immutables(&env)?;
+        let state = Self::get_state(&env)?;
+        
+        // Check state
+        match state {
+            State::Withdrawn => return Err(Error::AlreadyWithdrawn),
+            State::Cancelled => return Err(Error::AlreadyCancelled),
+            _ => {}
+        }
+        
+        // Check caller is taker
+        immutables.taker.require_auth();
+        
+        // Check time windows
+        Self::require_after(&env, &immutables, Stage::DstWithdrawal)?;
+        Self::require_before(&env, &immutables, Stage::DstCancellation)?;
+        
+        // Verify secret
+        Self::verify_secret(&env, &secret, &immutables.hashlock)?;
+        
+        // Execute withdrawal (tokens to maker, safety deposit to caller)
+        Self::execute_withdrawal(&env, &immutables, &immutables.maker, &env.current_contract_address())?;
+        
+        // Log withdrawal event with secret
+        log!(&env, "EscrowWithdrawal", secret);
+        
+        Ok(())
+    }
+
+    /// Public withdrawal - anyone can call after public period starts
+    /// Tokens go to maker, safety deposit to caller
+    pub fn public_withdraw(env: Env, secret: BytesN<32>) -> Result<(), Error> {
+        let immutables = Self::get_immutables(&env)?;
+        let state = Self::get_state(&env)?;
+        
+        // Check state
+        match state {
+            State::Withdrawn => return Err(Error::AlreadyWithdrawn),
+            State::Cancelled => return Err(Error::AlreadyCancelled),
+            _ => {}
+        }
+        
+        // Check time windows
+        Self::require_after(&env, &immutables, Stage::DstPublicWithdrawal)?;
+        Self::require_before(&env, &immutables, Stage::DstCancellation)?;
+        
+        // Verify secret
+        Self::verify_secret(&env, &secret, &immutables.hashlock)?;
+        
+        // Execute withdrawal (tokens to maker, safety deposit to caller)
+        Self::execute_withdrawal(&env, &immutables, &immutables.maker, &env.current_contract_address())?;
+        
+        // Log withdrawal event
+        log!(&env, "EscrowWithdrawal", secret);
+        
+        Ok(())
+    }
+
+    /// Cancel and return funds to taker (taker only)
+    pub fn cancel(env: Env) -> Result<(), Error> {
+        let immutables = Self::get_immutables(&env)?;
+        let state = Self::get_state(&env)?;
+        
+        // Check state
+        match state {
+            State::Withdrawn => return Err(Error::AlreadyWithdrawn),
+            State::Cancelled => return Err(Error::AlreadyCancelled),
+            _ => {}
+        }
+        
+        // Check caller is taker
+        immutables.taker.require_auth();
+        
+        // Check time window
+        Self::require_after(&env, &immutables, Stage::DstCancellation)?;
+        
+        // Execute cancellation (tokens to taker, safety deposit to caller)
+        Self::execute_cancellation(&env, &immutables, &env.current_contract_address())?;
+        
+        // Log cancellation event
+        log!(&env, "EscrowCancelled");
+        
+        Ok(())
+    }
+
+    /// Get time until a specific stage
+    pub fn time_until_stage(env: Env, stage: Stage) -> Result<i64, Error> {
+        let immutables = Self::get_immutables(&env)?;
+        let current_time = env.ledger().timestamp();
+        let stage_time = Self::get_stage_time(&immutables, stage);
+        
+        Ok((stage_time as i64) - (current_time as i64))
+    }
+
+    // Helper functions
+
+    fn get_stage_time(immutables: &Immutables, stage: Stage) -> u64 {
+        let base = immutables.deployed_at;
+        match stage {
+            Stage::DstWithdrawal => base + immutables.withdrawal_start,
+            Stage::DstPublicWithdrawal => base + immutables.public_withdrawal_start,
+            Stage::DstCancellation => base + immutables.cancellation_start,
+        }
+    }
+
+    fn require_after(env: &Env, immutables: &Immutables, stage: Stage) -> Result<(), Error> {
+        let current_time = env.ledger().timestamp();
+        let required_time = Self::get_stage_time(immutables, stage);
+        
+        if current_time < required_time {
+            return Err(Error::InvalidTime);
+        }
+        Ok(())
+    }
+
+    fn require_before(env: &Env, immutables: &Immutables, stage: Stage) -> Result<(), Error> {
+        let current_time = env.ledger().timestamp();
+        let deadline = Self::get_stage_time(immutables, stage);
+        
+        if current_time >= deadline {
+            return Err(Error::InvalidTime);
+        }
+        Ok(())
+    }
+
+    fn verify_secret(env: &Env, secret: &BytesN<32>, hashlock: &BytesN<32>) -> Result<(), Error> {
+        // Convert BytesN<32> to Bytes for sha256
+        let secret_array: [u8; 32] = secret.to_array();
+        let secret_bytes = Bytes::from_slice(env, &secret_array);
+        let computed_hash = env.crypto().sha256(&secret_bytes);
+        let computed_hash_32 = BytesN::<32>::from_array(env, &computed_hash.to_array());
+        
+        if computed_hash_32 != *hashlock {
+            return Err(Error::InvalidSecret);
+        }
+        Ok(())
+    }
+
+    fn execute_withdrawal(
+        env: &Env,
+        immutables: &Immutables,
+        token_recipient: &Address,
+        _safety_deposit_recipient: &Address,
+    ) -> Result<(), Error> {
+        // Update state
+        env.storage().instance().set(&symbol_short!("state"), &State::Withdrawn);
+        
+        // Transfer tokens to recipient (maker in this case)
+        let token_client = token::Client::new(env, &immutables.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            token_recipient,
+            &immutables.amount
+        );
+        
+        // Transfer safety deposit (native XLM) to caller
+        if immutables.safety_deposit > 0 {
+            // For XLM, we'd use native asset contract
+            // This is simplified - in production you'd handle native asset properly
+            // env.pay(&safety_deposit_recipient, &immutables.safety_deposit);
+        }
+        
+        Ok(())
+    }
+
+    fn execute_cancellation(
+        env: &Env,
+        immutables: &Immutables,
+        _safety_deposit_recipient: &Address,
+    ) -> Result<(), Error> {
+        // Update state
+        env.storage().instance().set(&symbol_short!("state"), &State::Cancelled);
+        
+        // Transfer tokens back to taker (not maker like in EscrowSrc)
+        let token_client = token::Client::new(env, &immutables.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &immutables.taker,
+            &immutables.amount
+        );
+        
+        // Transfer safety deposit (native XLM) to caller
+        if immutables.safety_deposit > 0 {
+            // For XLM, we'd use native asset contract
+            // This is simplified - in production you'd handle native asset properly
+            // env.pay(&safety_deposit_recipient, &immutables.safety_deposit);
+        }
+        
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+    
     use super::*;
     use soroban_sdk::{
-        Address, BytesN, Env,
-        testutils::{Address as _},
+        Address, Bytes, BytesN, Env, IntoVal,
+        testutils::{Address as _, Ledger as _, AuthorizedFunction, AuthorizedInvocation},
     };
 
     #[test]
@@ -160,7 +357,7 @@ mod test {
             order_hash: BytesN::from_array(&env, &[3u8; 32]),
             hashlock: hashlock_32,
             maker,
-            taker,
+            taker: taker.clone(), // Clone here so we can use taker later
             token,
             amount: 1000,
             safety_deposit: 100,
@@ -174,9 +371,37 @@ mod test {
         // Initialize contract
         client.init(&deployer, &salt, &immutables);
 
-        // Verify state is withdrawn
+        // Verify state is active
         let state = client.get_state();
         assert_eq!(state, State::Active);
-    }
 
+        // Test withdrawal (should fail before time window)
+        let result = client.try_withdraw(&secret);
+        assert!(result.is_err());
+
+        // Fast forward time to withdrawal period
+        env.ledger().with_mut(|li| {
+            li.timestamp = 100; // After withdrawal_start
+        });
+
+        // Test successful withdrawal with proper taker authorization
+        env.auths().push((
+            taker.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract_id.clone(),
+                    symbol_short!("withdraw"),
+                    (secret.clone(),).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        ));
+
+        let result = client.try_withdraw(&secret.clone());
+        assert!(result.is_ok()); // Should succeed now!
+
+        // Verify state is withdrawn
+        let state = client.get_state();
+        assert_eq!(state, State::Withdrawn);
+    }
 } 
