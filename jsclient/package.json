@@ -9,11 +9,11 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@stellar/stellar-sdk": "^13.3.0",
-    "stellar-hd-wallet": "^1.0.2",
-    "@1inch/cross-chain-sdk": "v0.1.15-rc.0",
-    "@1inch/byte-utils": "2.6.0",
-    "ethers": "6.13.2",
-    "dotenv": "16.4.5"
+    "@stellar/stellar-sdk": "14.0.0-rc.3",
+    "stellar-hd-wallet": "1.0.2",
+    "@1inch/cross-chain-sdk": "0.1.15",
+    "@1inch/byte-utils": "3.1.0",
+    "ethers": "6.15.0",
+    "dotenv": "17.2.1"
   }
 }
