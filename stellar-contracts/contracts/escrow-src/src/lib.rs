@@ -17,11 +17,14 @@ pub struct Immutables {
     pub amount: i128,
     pub safety_deposit: i128,
     pub deployed_at: u64,
-    // Timelock durations in seconds from deployment (source-specific)
+    // Timelock durations in seconds from deployment
     pub src_withdrawal_start: u32,      // When taker can withdraw
     pub src_public_withdrawal_start: u32, // When anyone can withdraw for taker
     pub src_cancellation_start: u32,     // When taker can cancel
     pub src_public_cancellation_start: u32, // When anyone can cancel
+    pub dst_withdrawal_start: u32,      // When taker can withdraw
+    pub dst_public_withdrawal_start: u32, // When anyone can withdraw for taker
+    pub dst_cancellation_start: u32,     // When taker can cancel
 }
 
 /// Stages for source escrow timelocks
